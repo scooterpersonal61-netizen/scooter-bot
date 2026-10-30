@@ -10,9 +10,12 @@ bot = telebot.TeleBot(TOKEN)
 SIGNATURE = "\n\nС уважением, представители магазина Скутер Персонал."
 
 def clean_text(text):
-    """Очистка от мусора, ссылок и лишних символов"""
+    """Жесткая очистка от мусора и галлюцинаций"""
     text = re.sub(r'https?://\S+|www\.\S+', '', text)
     text = re.sub(r'\b\w+\.(ru|ua|com|net|org|info|biz|eu)\b', '', text, flags=re.IGNORECASE)
+    # Удаляем висящие слова
+    text = re.sub(r'Источник|источник|Ссылка|ссылка', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\b(140|139|150|125)\s*(куб|см|сс)\b', '', text, flags=re.IGNORECASE) # Убиваем выдуманные объемы
     # Оставляем только русские буквы, цифры и базовую пунктуацию
     text = re.sub(r'[^а-яА-ЯёЁ0-9\s.,!?-]', '', text)
     text = re.sub(r'\.\s*\.', '.', text)
@@ -25,34 +28,34 @@ def find_exact_answer(user_text):
         with open('knowledge.txt', 'r', encoding='utf-8') as f:
             content = f.read()
             
-        # Ищем блок с готовыми ответами
         if "=== ГОТОВЫЕ АВТОНОМНЫЕ ОТВЕТЫ" in content:
+            # Вырезаем блок с готовыми ответами
             answers_block = content.split("=== ГОТОВЫЕ АВТОНОМНЫЕ ОТВЕТЫ")[1].split("===")[0]
             lines = answers_block.split('\n')
             
-            # Приводим вопрос пользователя к нижнему регистру для поиска
             search_text = user_text.lower()
+            user_words = set(re.findall(r'\w+', search_text))
             
             for line in lines:
-                if "ВОПРОС |" in line and "ОТВЕТ |" in line:
+                if "ВОПРОС" in line and "ОТВЕТ" in line:
                     parts = line.split("|")
-                    if len(parts) >= 3:
+                    if len(parts) >= 4:
                         db_question = parts[1].strip().lower()
-                        db_answer = parts[2].replace("ОТВЕТ", "").strip()
+                        db_answer = parts[3].strip() # Берем 4-й элемент (после "ОТВЕТ |")
                         
-                        # Если ключевые слова из базы совпадают с вопросом пользователя
-                        # (проверяем, есть ли в вопросе пользователя 2+ слова из базы)
-                        db_words = [w for w in re.findall(r'\w+', db_question) if len(w) > 2]
-                        matches = sum(1 for w in db_words if w in search_text)
+                        # Сравниваем слова из вопроса в базе и в вопросе пользователя
+                        db_words = set(re.findall(r'\w+', db_question))
+                        intersection = user_words.intersection(db_words)
                         
-                        if matches >= 2 or (len(db_words) > 0 and db_words[0] in search_text and len(db_words) <= 2):
+                        # Если совпало 3 и более ключевых слова (например: цпг, 40, мм, stels)
+                        if len(intersection) >= 3:
                             return db_answer
     except Exception as e:
         print(f"Ошибка чтения базы: {e}")
     return None
 
 def get_context_for_ai(user_text):
-    """Если точного ответа нет, собирает контекст из правил и шаблонов"""
+    """Собирает контекст, если точного ответа нет"""
     try:
         with open('knowledge.txt', 'r', encoding='utf-8') as f:
             lines = f.readlines()
@@ -63,55 +66,47 @@ def get_context_for_ai(user_text):
     scored_lines = []
     
     for line in lines:
-        # Пропускаем пустые строки и ссылки
         if not line.strip() or line.strip().startswith("==="): continue
         clean_line = re.sub(r'https?://\S+', '', line.strip())
         line_lower = clean_line.lower()
         
         matches = sum(1 for word in words if word in line_lower)
-        if matches >= 2 or (matches == 1 and any(len(w) > 4 for w in words if w in line_lower)):
+        if matches >= 2:
             scored_lines.append((matches, clean_line))
 
     scored_lines.sort(key=lambda x: x[0], reverse=True)
-    
-    # Берем топ-5 строк + добавляем шаблоны, чтобы ИИ знал, как отвечать
     context = "\n".join([text for _, text in scored_lines[:5]])
     templates = "\n".join([line.strip() for line in lines if "ШАБЛОН_" in line])
     
-    return f"КОНТЕКСТ ИЗ БАЗЫ:\n{context}\n\nДОСТУПНЫЕ ШАБЛОНЫ ДЛЯ ОТВЕТА:\n{templates}"
+    return f"КОНТЕКСТ ИЗ БАЗЫ:\n{context}\n\nДОСТУПНЫЕ ШАБЛОНЫ:\n{templates}"
 
 @bot.message_handler(content_types=['text'])
 def handle_message(message):
     bot.send_chat_action(message.chat.id, 'typing')
     
-    # 1. ПЫТАЕМСЯ НАЙТИ ГОТОВЫЙ ОТВЕТ (БЕЗ НЕЙРОСЕТИ)
+    # 1. ИЩЕМ ГОТОВЫЙ ОТВЕТ (БЕЗ НЕЙРОСЕТИ)
     exact_answer = find_exact_answer(message.text)
     
     if exact_answer:
-        # Если нашли готовый ответ, просто отправляем его
         final_reply = clean_text(exact_answer) + SIGNATURE
         bot.reply_to(message, final_reply)
         return
 
-    # 2. ЕСЛИ ГОТОВОГО НЕТ, ИДЕМ В НЕЙРОСЕТЬ С ЖЕСТКИМИ ПРАВИЛАМИ
+    # 2. ЕСЛИ ГОТОВОГО НЕТ, ИДЕМ В НЕЙРОСЕТЬ
     context = get_context_for_ai(message.text)
     
-    system_prompt = f"""Ты — робот-консультант магазина "Скутер Персонал".
-Твоя задача — дать ответ, используя ТОЛЬКО предоставленный контекст и шаблоны.
+    system_prompt = f"""Ты — строгий консультант магазина "Скутер Персонал".
+Отвечай, используя ТОЛЬКО предоставленный контекст и шаблоны.
 
 {context}
 
-КРИТИЧЕСКИЕ ПРАВИЛА (Нарушение недопустимо):
-1. ПРАВИЛО_12: НИКОГДА не задавай встречных вопросов. Не проси фото, VIN или замеры.
-2. ПРАВИЛО_6: НЕ ВЫДУМЫВАЙ цифры, объемы (например, "140 кубов") или маркировки, если их нет в контексте.
-3. ПРАВИЛО_10: В ответе 1-3 предложения, без воды.
-4. Если ты не знаешь точного ответа, используй ШАБЛОН_НЕИЗВЕСТНО или ШАБЛОН_УСЛОВНО из списка выше. Подставь нужную модель.
-5. Если деталь конструктивно не подходит (2Т vs 4Т), используй ШАБЛОН_НЕТ.
+ПРАВИЛА:
+1. НИКОГДА не пиши цифры объема двигателя (140, 150, 125), если их нет в вопросе покупателя. Если нужно, пиши "двигатель семейства 139QMB" или "двигатель 1E40QMB".
+2. НЕ ЗАДАВАЙ ВОПРОСОВ. Не проси фото или замеры.
+3. Если точной информации нет, используй ШАБЛОН_НЕИЗВЕСТНО из списка выше.
+4. Ответ — максимум 3 предложения.
 
-КАТЕГОРИЧЕСКИЕ ЗАПРЕТЫ:
-- Никаких ссылок.
-- Никаких скобок и английских слов.
-- Никаких фраз "уточните", "пришлите фото".
+ЗАПРЕТЫ: Никаких ссылок, скобок и слова "Источник".
 """
 
     headers = {
@@ -120,7 +115,7 @@ def handle_message(message):
     }
     
     data = {
-        "model": "deepseek/deepseek-chat", # Отключаем поиск в интернете, чтобы не было мусора
+        "model": "deepseek/deepseek-chat", 
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": message.text}
@@ -148,5 +143,5 @@ def handle_message(message):
     except Exception as e:
         bot.reply_to(message, "Здравствуйте! Извините, сервис временно недоступен." + SIGNATURE)
 
-print("ИДЕАЛЬНЫЙ БОТ С БАЗОЙ V5 ЗАПУЩЕН!")
+print("ИДЕАЛЬНЫЙ БОТ V6 ЗАПУЩЕН!")
 bot.polling(non_stop=True)
