@@ -10,14 +10,14 @@ bot = telebot.TeleBot(TOKEN)
 SIGNATURE = "\n\nС уважением, представители магазина Скутер Персонал."
 
 def clean_text(text):
-    """Жесткая очистка от мусора и галлюцинаций"""
+    """Умная очистка (не трогает коды двигателей)"""
     text = re.sub(r'https?://\S+|www\.\S+', '', text)
     text = re.sub(r'\b\w+\.(ru|ua|com|net|org|info|biz|eu)\b', '', text, flags=re.IGNORECASE)
-    # Удаляем висящие слова
     text = re.sub(r'Источник|источник|Ссылка|ссылка', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'\b(140|139|150|125)\s*(куб|см|сс)\b', '', text, flags=re.IGNORECASE) # Убиваем выдуманные объемы
-    # Оставляем только русские буквы, цифры и базовую пунктуацию
-    text = re.sub(r'[^а-яА-ЯёЁ0-9\s.,!?-]', '', text)
+    
+    # ТЕПЕРЬ МЫ ОСТАВЛЯЕМ АНГЛИЙСКИЕ БУКВЫ (a-zA-Z), чтобы не ломать коды вроде 1E40QMB
+    text = re.sub(r'[^a-zA-Zа-яА-ЯёЁ0-9\s.,!?-]', '', text) 
+    
     text = re.sub(r'\.\s*\.', '.', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
@@ -29,33 +29,37 @@ def find_exact_answer(user_text):
             content = f.read()
             
         if "=== ГОТОВЫЕ АВТОНОМНЫЕ ОТВЕТЫ" in content:
-            # Вырезаем блок с готовыми ответами
             answers_block = content.split("=== ГОТОВЫЕ АВТОНОМНЫЕ ОТВЕТЫ")[1].split("===")[0]
             lines = answers_block.split('\n')
             
             search_text = user_text.lower()
-            user_words = set(re.findall(r'\w+', search_text))
             
+            # 1. Спец-проверка для ЦПГ (чтобы точно сработало)
+            if "цпг" in search_text and "40" in search_text and ("stels" in search_text or "стелс" in search_text or "скиф" in search_text):
+                for line in lines:
+                    if "ЦПГ 40 мм на Stels Skif 50" in line:
+                        return line.split("|")[3].strip()
+
+            # 2. Общий поиск по другим вопросам
             for line in lines:
                 if "ВОПРОС" in line and "ОТВЕТ" in line:
                     parts = line.split("|")
                     if len(parts) >= 4:
                         db_question = parts[1].strip().lower()
-                        db_answer = parts[3].strip() # Берем 4-й элемент (после "ОТВЕТ |")
+                        db_answer = parts[3].strip()
                         
-                        # Сравниваем слова из вопроса в базе и в вопросе пользователя
-                        db_words = set(re.findall(r'\w+', db_question))
-                        intersection = user_words.intersection(db_words)
+                        db_words = [w for w in re.findall(r'\w+', db_question) if len(w) > 2]
+                        if not db_words: continue
                         
-                        # Если совпало 3 и более ключевых слова (например: цпг, 40, мм, stels)
-                        if len(intersection) >= 3:
+                        matches = sum(1 for w in db_words if w in search_text)
+                        # Если 60% слов из базы есть в вопросе
+                        if matches >= len(db_words) * 0.6:
                             return db_answer
     except Exception as e:
         print(f"Ошибка чтения базы: {e}")
     return None
 
 def get_context_for_ai(user_text):
-    """Собирает контекст, если точного ответа нет"""
     try:
         with open('knowledge.txt', 'r', encoding='utf-8') as f:
             lines = f.readlines()
@@ -84,7 +88,7 @@ def get_context_for_ai(user_text):
 def handle_message(message):
     bot.send_chat_action(message.chat.id, 'typing')
     
-    # 1. ИЩЕМ ГОТОВЫЙ ОТВЕТ (БЕЗ НЕЙРОСЕТИ)
+    # 1. ИЩЕМ ГОТОВЫЙ ОТВЕТ
     exact_answer = find_exact_answer(message.text)
     
     if exact_answer:
@@ -92,7 +96,7 @@ def handle_message(message):
         bot.reply_to(message, final_reply)
         return
 
-    # 2. ЕСЛИ ГОТОВОГО НЕТ, ИДЕМ В НЕЙРОСЕТЬ
+    # 2. ЕСЛИ НЕТ, ИДЕМ В НЕЙРОСЕТЬ
     context = get_context_for_ai(message.text)
     
     system_prompt = f"""Ты — строгий консультант магазина "Скутер Персонал".
@@ -100,8 +104,8 @@ def handle_message(message):
 
 {context}
 
-ПРАВИЛА:
-1. НИКОГДА не пиши цифры объема двигателя (140, 150, 125), если их нет в вопросе покупателя. Если нужно, пиши "двигатель семейства 139QMB" или "двигатель 1E40QMB".
+КРИТИЧЕСКИЕ ПРАВИЛА:
+1. НИКОГДА не превращай коды двигателей (например, 1E40QMB, 139QMB) в цифры (140, 139). Это коды, а не объем.
 2. НЕ ЗАДАВАЙ ВОПРОСОВ. Не проси фото или замеры.
 3. Если точной информации нет, используй ШАБЛОН_НЕИЗВЕСТНО из списка выше.
 4. Ответ — максимум 3 предложения.
@@ -143,5 +147,5 @@ def handle_message(message):
     except Exception as e:
         bot.reply_to(message, "Здравствуйте! Извините, сервис временно недоступен." + SIGNATURE)
 
-print("ИДЕАЛЬНЫЙ БОТ V6 ЗАПУЩЕН!")
+print("БОТ V7 ЗАПУЩЕН!")
 bot.polling(non_stop=True)
