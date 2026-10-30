@@ -10,30 +10,49 @@ bot = telebot.TeleBot(TOKEN)
 SIGNATURE = "\n\nС уважением, представители магазина Скутер Персонал."
 
 def find_in_knowledge(user_text):
+    """Умный поиск по базе с очисткой от ссылок и мусора"""
     try:
         with open('knowledge.txt', 'r', encoding='utf-8') as f:
             lines = f.readlines()
     except FileNotFoundError:
         return "НЕТ_СОВПАДЕНИЙ_В_БАЗЕ"
     
+    # Разбиваем вопрос на слова
     words = [w.lower() for w in re.findall(r'\w+', user_text) if len(w) > 2]
     if not words:
         return "НЕТ_СОВПАДЕНИЙ_В_БАЗЕ"
 
     scored_lines = []
-    for i, line in enumerate(lines):
-        if "=== ОТВЕТЫ WB OZON ===" in line:
-            break
-        line_lower = line.lower()
+    for line in lines:
+        # Пропускаем пустые строки и разделители
+        if not line.strip() or line.strip().startswith("==="):
+            continue
+            
+        # Очищаем строку от ссылок, чтобы нейросеть их не видела
+        clean_line = re.sub(r'https?://\S+', '', line.strip())
+        
+        line_lower = clean_line.lower()
         matches = sum(1 for word in words if word in line_lower)
-        if matches >= 2 or any(word in line_lower for word in words if len(word) > 4):
-            scored_lines.append((matches, line.strip()))
+        
+        # Если есть совпадения (минимум 1, если слово длинное, или 2+)
+        if matches >= 2 or (matches == 1 and any(len(w) > 4 for w in words if w in line_lower)):
+            scored_lines.append((matches, clean_line))
 
     if not scored_lines:
         return "НЕТ_СОВПАДЕНИЙ_В_БАЗЕ"
 
+    # Сортируем по релевантности и берем ТОП-5 лучших строк для контекста
     scored_lines.sort(key=lambda x: x[0], reverse=True)
-    return scored_lines[0][1]
+    
+    # Убираем дубликаты и берем 5 штук
+    unique_results = []
+    for score, text in scored_lines:
+        if text not in unique_results:
+            unique_results.append(text)
+        if len(unique_results) >= 5:
+            break
+            
+    return "\n---\n".join(unique_results)
 
 @bot.message_handler(content_types=['text'])
 def handle_message(message):
@@ -41,20 +60,23 @@ def handle_message(message):
     
     context = find_in_knowledge(message.text)
     
-    system_prompt = f"""Ты — эксперт по мототехнике магазина "Скутер Персонал". Твоя задача — дать точный ответ покупателю.
-Контекст из Базы Знаний:
+    system_prompt = f"""Ты — технически грамотный эксперт магазина "Скутер Персонал".
+Твоя задача — ответить покупателю на основе нашей Базы Знаний.
+
+Вот отрывки из базы, которые подходят к вопросу:
 {context}
 
 ИНСТРУКЦИЯ:
-1. Если в вопросе упоминается конкретная модель скутера (например, Honling Titan, Honda Dio, K2R), а в базе есть двигатель (например, 139QMB) — ИСПОЛЬЗУЙ ВЕБ-ПОИСК. Проверь в интернете, какой двигатель стоит на этом скутере.
-2. Если окажется, что на Honling Titan стоит двигатель 139QMB — пиши смело: "Здравствуйте! Да, этот коленвал подойдет, так как на Honling Titan устанавливается двигатель 139QMB."
-3. Если в контексте из базы есть статус "Условно", но веб-поиск подтвердил совместимость — ОТВЕЧАЙ "Подходит", игнорируя статус "Условно".
-4. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО писать фразы: "Уточните диаметры", "Уточните ширину", "Сверьте по фото", "Проверьте размеры". Покупатель не имеет микрометра, чтобы мерить коленвал.
-5. Если база и интернет не дают ответа, пиши: "Здравствуйте! По этому артикулу информация уточняется."
+1. Изучи контекст. Если в нем есть "ШАБЛОН ОТВЕТА" или "ГОТОВЫЙ ОТВЕТ" на похожий вопрос — используй его ПОЧТИ ДОСЛОВНО.
+2. Если статус "ПОДТВЕРЖДЕНО" — уверенно пиши, что деталь подходит.
+3. Если статус "УСЛОВНО" или "НЕ ПОДТВЕРЖДЕНО" — пиши, что деталь может подойти, но нужно проверить конкретные параметры (например, количество зубьев или шлицов). Не используй фразу "сверьте по фото", вместо этого попроси назвать маркировку двигателя или количество зубьев.
+4. Если в контексте нет ответа, но есть веб-поиск — найди информацию и дай осторожный ответ.
+5. СТИЛЬ: Профессионально, четко, по делу.
 
-ЗАПРЕТЫ:
-- НИКАКИХ ссылок, доменов (типа .ua, .ru), скобок и спецсимволов.
-- Никаких "100%", "гарантирую".
+КАТЕГОРИЧЕСКИЕ ЗАПРЕТЫ:
+- НИКАКИХ ссылок и упоминаний сайтов.
+- НИКАКИХ фраз "уточните в карточке", "посмотрите в описании", "сверьте по фото".
+- Максимум 3-4 предложения.
 """
 
     headers = {
@@ -77,17 +99,22 @@ def handle_message(message):
         if 'choices' in response_data:
             ai_reply = response_data['choices'][0]['message']['content'].strip()
             
-            # --- УМНАЯ ОЧИСТКА ---
-            ai_reply = re.sub(r'\!?\[.*?\]\(.*?\)', '', ai_reply)
+            # --- АБСОЛЮТНАЯ ОЧИСТКА ---
+            # 1. Удаляем ссылки
             ai_reply = re.sub(r'https?://\S+|www\.\S+', '', ai_reply)
-            ai_reply = re.sub(r'\b\w+\.(ru|ua|com|net|org|info|biz)\b', '', ai_reply, flags=re.IGNORECASE)
-            # Оставляем только буквы, цифры и базовые знаки
+            ai_reply = re.sub(r'\b\w+\.(ru|ua|com|net|org|info|biz|eu)\b', '', ai_reply, flags=re.IGNORECASE)
+            # 2. Удаляем скобки и спецсимволы (разрешаем только буквы, цифры, базовую пунктуацию)
             ai_reply = re.sub(r'[^a-zA-Zа-яА-ЯёЁ0-9\s.,!?-]', '', ai_reply)
+            # 3. Убираем висящие предлоги/запятые
+            ai_reply = re.sub(r'\b(с|со|на|из|от)\s*[,.]', '', ai_reply, flags=re.IGNORECASE)
+            # 4. Вырезаем фразы-паразиты
+            ai_reply = re.sub(r'(сверьте|посмотрите|уточните|сравните).{0,30}(карточке|фото|описании|деталью)', '', ai_reply, flags=re.IGNORECASE)
+            
             ai_reply = re.sub(r'\.\s*\.', '.', ai_reply)
             ai_reply = re.sub(r'\s+', ' ', ai_reply).strip()
             
             if len(ai_reply) < 15:
-                ai_reply = "По этому артикулу информация уточняется."
+                ai_reply = "Для точного ответа уточните маркировку двигателя и количество зубьев на старой детали."
 
             if not ai_reply.lower().startswith("здравствуйте") and not ai_reply.lower().startswith("извините"):
                 ai_reply = "Здравствуйте! " + ai_reply
@@ -100,5 +127,5 @@ def handle_message(message):
     except Exception as e:
         bot.reply_to(message, "Здравствуйте! Извините, сервис временно недоступен." + SIGNATURE)
 
-print("БОТ С ЛОГИКОЙ И ВЕБ-ПОИСКОМ ЗАПУЩЕН!")
+print("МОЩНЫЙ БОТ С УМНЫМ ПОИСКОМ ЗАПУЩЕН!")
 bot.polling(non_stop=True)
