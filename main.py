@@ -10,14 +10,12 @@ bot = telebot.TeleBot(TOKEN)
 SIGNATURE = "\n\nС уважением, представители магазина Скутер Персонал."
 
 def clean_text(text):
-    """Умная очистка (не трогает коды двигателей)"""
+    """Очистка от мусора, но НЕ трогает английские буквы и коды"""
     text = re.sub(r'https?://\S+|www\.\S+', '', text)
     text = re.sub(r'\b\w+\.(ru|ua|com|net|org|info|biz|eu)\b', '', text, flags=re.IGNORECASE)
     text = re.sub(r'Источник|источник|Ссылка|ссылка', '', text, flags=re.IGNORECASE)
-    
-    # ТЕПЕРЬ МЫ ОСТАВЛЯЕМ АНГЛИЙСКИЕ БУКВЫ (a-zA-Z), чтобы не ломать коды вроде 1E40QMB
+    # Оставляем ВСЁ, кроме спецсимволов
     text = re.sub(r'[^a-zA-Zа-яА-ЯёЁ0-9\s.,!?-]', '', text) 
-    
     text = re.sub(r'\.\s*\.', '.', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
@@ -34,13 +32,14 @@ def find_exact_answer(user_text):
             
             search_text = user_text.lower()
             
-            # 1. Спец-проверка для ЦПГ (чтобы точно сработало)
+            # ЖЕСТКАЯ ПРОВЕРКА ДЛЯ ЦПГ (чтобы гарантированно взять из базы)
             if "цпг" in search_text and "40" in search_text and ("stels" in search_text or "стелс" in search_text or "скиф" in search_text):
                 for line in lines:
                     if "ЦПГ 40 мм на Stels Skif 50" in line:
+                        # Возвращаем ТОЛЬКО текст ответа, пропуская "ВОПРОС | ... | ОТВЕТ |"
                         return line.split("|")[3].strip()
 
-            # 2. Общий поиск по другим вопросам
+            # Поиск по остальным вопросам
             for line in lines:
                 if "ВОПРОС" in line and "ОТВЕТ" in line:
                     parts = line.split("|")
@@ -52,21 +51,33 @@ def find_exact_answer(user_text):
                         if not db_words: continue
                         
                         matches = sum(1 for w in db_words if w in search_text)
-                        # Если 60% слов из базы есть в вопросе
                         if matches >= len(db_words) * 0.6:
                             return db_answer
     except Exception as e:
         print(f"Ошибка чтения базы: {e}")
     return None
 
-def get_context_for_ai(user_text):
+@bot.message_handler(content_types=['text'])
+def handle_message(message):
+    bot.send_chat_action(message.chat.id, 'typing')
+    
+    # 1. ИЩЕМ ГОТОВЫЙ ОТВЕТ
+    exact_answer = find_exact_answer(message.text)
+    
+    if exact_answer:
+        # Если нашли, отправляем его НАПРЯМУЮ, без нейросети
+        final_reply = clean_text(exact_answer) + SIGNATURE
+        bot.reply_to(message, final_reply)
+        return
+
+    # 2. ЕСЛИ НЕТ, ИДЕМ В НЕЙРОСЕТЬ (с жесткими правилами)
     try:
         with open('knowledge.txt', 'r', encoding='utf-8') as f:
             lines = f.readlines()
     except:
-        return "База не найдена"
+        lines = []
 
-    words = [w.lower() for w in re.findall(r'\w+', user_text) if len(w) > 2]
+    words = [w.lower() for w in re.findall(r'\w+', message.text) if len(w) > 2]
     scored_lines = []
     
     for line in lines:
@@ -82,35 +93,20 @@ def get_context_for_ai(user_text):
     context = "\n".join([text for _, text in scored_lines[:5]])
     templates = "\n".join([line.strip() for line in lines if "ШАБЛОН_" in line])
     
-    return f"КОНТЕКСТ ИЗ БАЗЫ:\n{context}\n\nДОСТУПНЫЕ ШАБЛОНЫ:\n{templates}"
-
-@bot.message_handler(content_types=['text'])
-def handle_message(message):
-    bot.send_chat_action(message.chat.id, 'typing')
-    
-    # 1. ИЩЕМ ГОТОВЫЙ ОТВЕТ
-    exact_answer = find_exact_answer(message.text)
-    
-    if exact_answer:
-        final_reply = clean_text(exact_answer) + SIGNATURE
-        bot.reply_to(message, final_reply)
-        return
-
-    # 2. ЕСЛИ НЕТ, ИДЕМ В НЕЙРОСЕТЬ
-    context = get_context_for_ai(message.text)
-    
     system_prompt = f"""Ты — строгий консультант магазина "Скутер Персонал".
-Отвечай, используя ТОЛЬКО предоставленный контекст и шаблоны.
+Отвечай, используя ТОЛЬКО предоставленный контекст.
 
+КОНТЕКСТ:
 {context}
 
-КРИТИЧЕСКИЕ ПРАВИЛА:
-1. НИКОГДА не превращай коды двигателей (например, 1E40QMB, 139QMB) в цифры (140, 139). Это коды, а не объем.
-2. НЕ ЗАДАВАЙ ВОПРОСОВ. Не проси фото или замеры.
-3. Если точной информации нет, используй ШАБЛОН_НЕИЗВЕСТНО из списка выше.
-4. Ответ — максимум 3 предложения.
+ШАБЛОНЫ:
+{templates}
 
-ЗАПРЕТЫ: Никаких ссылок, скобок и слова "Источник".
+КРИТИЧЕСКИЕ ПРАВИЛА:
+1. НИКОГДА не превращай коды двигателей (например, 1E40QMB, 139QMB) в цифры (140, 139).
+2. НЕ ЗАДАВАЙ ВОПРОСОВ.
+3. Если точной информации нет, используй ШАБЛОН_НЕИЗВЕСТНО.
+4. Ответ — максимум 3 предложения.
 """
 
     headers = {
@@ -134,9 +130,6 @@ def handle_message(message):
             ai_reply = response_data['choices'][0]['message']['content'].strip()
             ai_reply = clean_text(ai_reply)
             
-            if len(ai_reply) < 15:
-                ai_reply = "По названию модели нельзя достоверно установить исполнение. Этот товар рассчитан на параметры, указанные в карточке."
-
             if not ai_reply.lower().startswith("здравствуйте") and not ai_reply.lower().startswith("извините"):
                 ai_reply = "Здравствуйте! " + ai_reply
                 
@@ -147,5 +140,5 @@ def handle_message(message):
     except Exception as e:
         bot.reply_to(message, "Здравствуйте! Извините, сервис временно недоступен." + SIGNATURE)
 
-print("БОТ V7 ЗАПУЩЕН!")
+print("ЖЕЛЕЗОБЕТОННЫЙ БОТ V8 ЗАПУЩЕН!")
 bot.polling(non_stop=True)
